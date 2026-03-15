@@ -1,7 +1,12 @@
 # ==============================================================================
 # MISCADA ASML Classification Summative Coursework
 # Dataset: Heart Failure Clinical Records
-# Objective: Predict fatal myocardial infarction (fatal_mi)
+# Objective: Predict whether a patient will suffer a fatal myocardial
+#            infarction during the follow-up period (fatal_mi).
+#
+# Target variable definition: 'fatal_mi' is defined by the course data
+# description as "whether the patient suffered a fatal myocardial infarction
+# during the follow-up period" (see heart_failure.txt provided by lecturer).
 #
 # NOTE: The variable 'time' (follow-up period in days) is EXCLUDED from all
 # models. It represents the observation window length and would not be
@@ -34,7 +39,9 @@ cat("Dimensions:", nrow(df), "rows x", ncol(df), "columns\n\n")
 factor_vars <- c("anaemia", "diabetes", "high_blood_pressure", "sex", "smoking")
 df[factor_vars] <- lapply(df[factor_vars], factor)
 
-# Convert target to factor: 1 -> "Yes" (Fatal MI), 0 -> "No" (Survived)
+# Convert target to factor:
+#   1 -> "Yes" (patient suffered fatal MI during follow-up)
+#   0 -> "No"  (patient did not suffer fatal MI during follow-up)
 df$fatal_mi <- factor(ifelse(df$fatal_mi == 1, "Yes", "No"), levels = c("Yes", "No"))
 
 # IMPORTANT: Remove 'time' — it is the follow-up period and leaks future info
@@ -143,14 +150,16 @@ ggplot(cor_melted, aes(x = Var1, y = Var2, fill = value)) +
 dev.off()
 
 # ------------------------------------------------------------------------------
-# 4. Data Splitting
+# 4. Data Splitting (Train / Test)
 # ------------------------------------------------------------------------------
 cat("\n===== 3. Data Splitting =====\n")
+# 75% train, 25% test — stratified split to maintain class proportions
 train_index <- createDataPartition(df$fatal_mi, p = 0.75, list = FALSE)
 train_data <- df[train_index, ]
 test_data <- df[-train_index, ]
+
 cat("Training set:", nrow(train_data), "observations\n")
-cat("Testing set: ", nrow(test_data), "observations\n")
+cat("Test set:    ", nrow(test_data), "observations\n")
 
 # ------------------------------------------------------------------------------
 # 5. Cross-Validation Setup
@@ -228,18 +237,19 @@ resamps <- resamples(model_list)
 cat("\nCV Summary:\n")
 print(summary(resamps))
 
-# Programmatically select the best model based on median CV ROC
-cv_roc_means <- sapply(model_list, function(m) {
+# Programmatically select the best model based on best CV ROC
+# (i.e., the ROC achieved at the optimal hyperparameter configuration)
+cv_roc_best <- sapply(model_list, function(m) {
   max(m$results$ROC)
 })
-cat("\nMean CV ROC for each model:\n")
-print(round(cv_roc_means, 4))
+cat("\nBest CV ROC for each model (at optimal hyperparameters):\n")
+print(round(cv_roc_best, 4))
 
-best_model_name <- names(which.max(cv_roc_means))
+best_model_name <- names(which.max(cv_roc_best))
 best_model <- model_list[[best_model_name]]
 cat(
   "\n>>> Best model selected automatically:", best_model_name,
-  "(CV ROC =", round(max(cv_roc_means), 4), ") <<<\n"
+  "(Best CV ROC =", round(max(cv_roc_best), 4), ") <<<\n"
 )
 
 # CV comparison boxplot
@@ -319,16 +329,19 @@ cal_summary <- merge(cal_summary, cal_counts, by = "bin")
 cat("\nCalibration table (predicted vs observed by decile):\n")
 print(cal_summary)
 
-# Calibration intercept and slope via logistic regression
-cal_model <- glm(actual ~ predicted, data = cal_df, family = "binomial")
+# Calibration intercept and slope via logistic regression on logit scale
+# Standard approach: regress actual outcome on logit(predicted probability)
+cal_df$logit_pred <- log(pmax(cal_df$predicted, 1e-8) /
+  pmax(1 - cal_df$predicted, 1e-8))
+cal_model <- glm(actual ~ logit_pred, data = cal_df, family = "binomial")
 cal_intercept <- coef(cal_model)[1]
 cal_slope <- coef(cal_model)[2]
 cat(
-  "\nCalibration intercept:", round(cal_intercept, 3),
+  "\nCalibration intercept (logit scale):", round(cal_intercept, 3),
   "(ideal = 0)\n"
 )
 cat(
-  "Calibration slope:    ", round(cal_slope, 3),
+  "Calibration slope (logit scale):    ", round(cal_slope, 3),
   "(ideal = 1)\n"
 )
 
@@ -352,12 +365,15 @@ ggplot(cal_summary, aes(x = predicted, y = actual)) +
 dev.off()
 
 # ------------------------------------------------------------------------------
-# 9. Threshold Tuning (Cost-Sensitive Post-Model Analysis)
+# 9. Threshold Analysis (Illustrative Post-Model Analysis)
 # ------------------------------------------------------------------------------
 cat("\n===== 8. Threshold Sweep & Cost-Sensitive Analysis =====\n")
 
 # In a clinical setting: Missing a fatal MI (False Negative) is far worse
-# than a false alarm (False Positive). We systematically sweep thresholds.
+# than a false alarm (False Positive). We illustrate how varying the
+# decision threshold affects Sensitivity vs Specificity on the test set.
+# NOTE: This is an exploratory analysis to demonstrate the trade-off,
+# not a formal threshold optimisation process.
 thresholds <- seq(0.05, 0.95, by = 0.05)
 threshold_results <- data.frame(
   threshold   = thresholds,
@@ -378,7 +394,6 @@ for (i in seq_along(thresholds)) {
   threshold_results$specificity[i] <- cm_t$byClass["Specificity"]
   threshold_results$ppv[i] <- cm_t$byClass["Pos Pred Value"]
   threshold_results$npv[i] <- cm_t$byClass["Neg Pred Value"]
-  # F1 score
   prec <- cm_t$byClass["Pos Pred Value"]
   rec <- cm_t$byClass["Sensitivity"]
   threshold_results$f1[i] <- ifelse(is.na(prec) | is.na(rec) | (prec + rec) == 0,
@@ -389,7 +404,7 @@ for (i in seq_along(thresholds)) {
 cat("\nThreshold sweep results:\n")
 print(threshold_results)
 
-# Select a clinical threshold that maximises Sensitivity >= 0.85
+# Illustrative clinical threshold: prioritise high Sensitivity (>= 0.85)
 clinical_candidates <- threshold_results[
   !is.na(threshold_results$sensitivity) & threshold_results$sensitivity >= 0.85,
 ]
@@ -399,7 +414,7 @@ if (nrow(clinical_candidates) > 0) {
 } else {
   optimal_threshold <- 0.30
 }
-cat("\nOptimal clinical threshold (Sensitivity >= 0.85):", optimal_threshold, "\n")
+cat("\nIllustrative clinical threshold (Sensitivity >= 0.85):", optimal_threshold, "\n")
 
 # Threshold sweep plot
 pdf("Threshold_Sweep.pdf", width = 10, height = 7)
@@ -427,21 +442,23 @@ legend("right",
 )
 dev.off()
 
-# Performance at the optimal clinical threshold
+# Performance at the illustrative clinical threshold
+cat("\n--- Performance at Illustrative Clinical Threshold (", optimal_threshold, ") ---\n")
 preds_clinical <- factor(ifelse(prob_preds$Yes > optimal_threshold, "Yes", "No"),
   levels = c("Yes", "No")
 )
 cm_clinical <- confusionMatrix(preds_clinical, test_data$fatal_mi, positive = "Yes")
-cat("\n--- Performance at Clinical Threshold (", optimal_threshold, ") ---\n")
 print(cm_clinical$table)
 cat("Sensitivity:", round(cm_clinical$byClass["Sensitivity"], 3), "\n")
 cat("Specificity:", round(cm_clinical$byClass["Specificity"], 3), "\n")
 
 # ------------------------------------------------------------------------------
-# 10. Precision-Recall Curve
-# ------------------------------------------------------------------------------
-cat("\n===== 9. Precision-Recall Curve =====\n")
+cat("\n===== 9. Precision-Recall Trade-off =====\n")
 
+# NOTE: This is a discrete threshold-based approximation of the
+# precision-recall relationship, not a continuous PR curve.
+# It shows how precision and recall trade off at different decision
+# thresholds, which is directly relevant to clinical decision-making.
 pr_data <- data.frame(
   threshold = threshold_results$threshold,
   precision = threshold_results$ppv,
@@ -449,14 +466,16 @@ pr_data <- data.frame(
 )
 pr_data <- pr_data[!is.na(pr_data$precision) & !is.na(pr_data$recall), ]
 
-pdf("PR_Curve.pdf", width = 8, height = 7)
+pdf("Precision_Recall_Tradeoff.pdf", width = 8, height = 7)
 ggplot(pr_data, aes(x = recall, y = precision)) +
   geom_line(colour = "#E67E22", linewidth = 1.2) +
-  geom_point(colour = "#E67E22", size = 2) +
+  geom_point(aes(colour = threshold), size = 3) +
+  scale_colour_gradient(low = "#2ECC71", high = "#E74C3C", name = "Threshold") +
   coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
   theme_minimal(base_size = 13) +
   labs(
-    title = paste("Precision-Recall Curve -", best_model_name),
+    title = paste("Precision-Recall Trade-off -", best_model_name),
+    subtitle = "Discrete threshold sweep (test set)",
     x = "Recall (Sensitivity)", y = "Precision (PPV)"
   )
 dev.off()
